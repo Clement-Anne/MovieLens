@@ -1,0 +1,1090 @@
+---
+title: "MovieLens Report"
+author: "Clément ANNE"
+date: "07/03/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r preparation, echo=FALSE, include=FALSE}
+###Installing packages when needed
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(tinytex)) install.packages("tinytex", repos = "http://cran.us.r-project.org")
+
+
+###Loading packages
+library(tidyverse)
+library(caret)
+library(data.table)
+library(lubridate)
+library(knitr)
+library(tinytex)
+
+
+###Install tinytex if needed
+if(is_tinytex()==FALSE) tinytex::install_tinytex()
+
+###Free memory in the environment
+rm(list=ls())
+
+###Indication of computation start time
+computation_start <- now()
+
+###Downloading the MovieLens dataset
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+###MovieLens dataset
+movielens <- left_join(ratings, movies, by = "movieId")
+
+### Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") 
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+### Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+### Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+###Remove temporary files
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+
+# 1. Overview
+
+This analysis aims at predicting movie ratings thanks to the Movielens database from the GroupLens research lab. 
+
+Individuals (called users hereafter) have rated a selection of movies from 0.5 to 5 stars with half-star ratings enabled. This analysis relied on the 10 million movie ratings database to predict ratings of movie i by user u.
+
+Databases such as this one could be used to build a recommendation system by providing a list of movies a given user would be more likely to rate higher.
+
+While building the whole recommendation system is beyond the scope of this analysis, the development of a machine learning algorithm predicting movie ratings is a first step in the recommendation system build-up.
+
+I present in this analysis some algorithms modelling different biases in a Least Squares framework, while also regularizing for biases computed on lower sample sizes in a Penalized Least Squares model.
+
+
+# 2. Methods and analysis
+
+## 2.1. Data preparation
+
+```{r splitting_edx,echo=FALSE, include=FALSE}
+
+###edx split (edx_test will be 10% of edx)
+set.seed(1, sample.kind="Rounding") 
+edx_test_id <- createDataPartition(edx$rating,times=1,p=0.1,list=FALSE)
+edx_train <- edx[-edx_test_id]
+temp <- edx[edx_test_id]
+
+###Identification of rows in the test set without a movie ID or user ID in the train set
+edx_test <- temp %>% 
+  semi_join(edx_train, by = "movieId") %>%
+  semi_join(edx_train, by = "userId")
+removed <- anti_join(temp, edx_test)
+edx_train <- rbind(edx_train, removed)
+
+###Remove temporary files
+rm(temp,removed,edx_test_id)
+
+```
+
+```{r create_genre_types,echo=FALSE, include=FALSE}
+###Unique combinations of genres
+genres <- unique(edx$genres)
+length(genres)
+
+
+###No genres listed -> 1 unique film -> Consider is na (already film level bias)
+genres[str_detect(genres,"\\(")==TRUE]
+genres <- genres[str_detect(genres,"\\(")==FALSE] #Remove the NA genre
+
+###Split genres in columns
+genres_split <- str_split(genres,"\\|",simplify=TRUE)
+
+###Identify unique genres
+genres_types <- map_dfr(1:ncol(genres_split),function(i){
+  tibble(genre=unique(genres_split[,i]))
+})%>%
+  unique()
+genres_types <-genres_types[genres_types!=""]
+
+rm(genres,genres_split)
+```
+
+```{r data_cleaning,echo=FALSE, include=FALSE}
+
+####Remove edx dataset
+rm(edx)
+
+###Cleaning the edx_train set
+edx_train_clean <- edx_train%>%
+  #Convert timestamp into date
+  mutate(Date=as_datetime(timestamp)%>%as_date())%>%
+  group_by(movieId)%>%
+  #First date for a rating of movie i
+  mutate(min_date_movie=min(Date))%>%
+  ungroup()%>%
+  #Date gap since 1st rating of movie i
+  mutate(diff_date_movie=as.numeric(Date-min_date_movie))%>%
+  group_by(userId)%>%
+  #First date for a rating by user u
+  mutate(min_date_user=min(Date))%>%
+  ungroup()%>%
+  #Date gap since 1st rating by user u
+  mutate(diff_date_user=as.numeric(Date-min_date_user))%>%
+  #Convert date gaps in full weeks units
+  mutate(diff_date_user_w=floor(diff_date_user/7))%>%
+  mutate(diff_date_movie_w=floor(diff_date_movie/7))
+
+rm(edx_train)
+
+###Cleaning the edx_test set
+edx_test_clean <- edx_test%>%
+  #Convert timestamp into date
+  mutate(Date=as_datetime(timestamp)%>%as_date())%>%
+  group_by(movieId)%>%
+  #First date for a rating of movie i
+  mutate(min_date_movie=min(Date))%>%
+  ungroup()%>%
+  #Date gap since 1st rating of movie i
+  mutate(diff_date_movie=as.numeric(Date-min_date_movie))%>%
+  group_by(userId)%>%
+  #First date for a rating by user u
+  mutate(min_date_user=min(Date))%>%
+  ungroup()%>%
+  #Date gap since 1st rating by user u
+  mutate(diff_date_user=as.numeric(Date-min_date_user))%>%
+  #Convert date gaps in full weeks units
+  mutate(diff_date_user_w=floor(diff_date_user/7))%>%
+  mutate(diff_date_movie_w=floor(diff_date_movie/7))
+
+rm(edx_test)
+
+###Cleaning the validation set
+validation_clean <- validation%>%
+  #Convert timestamp into date
+  mutate(Date=as_datetime(timestamp)%>%as_date())%>%
+  group_by(movieId)%>%
+  #First date for a rating of movie i
+  mutate(min_date_movie=min(Date))%>%
+  ungroup()%>%
+  #Date gap since 1st rating of movie i
+  mutate(diff_date_movie=as.numeric(Date-min_date_movie))%>%
+  group_by(userId)%>%
+  #First date for a rating by user u
+  mutate(min_date_user=min(Date))%>%
+  ungroup()%>%
+  #Date gap since 1st rating by user u
+  mutate(diff_date_user=as.numeric(Date-min_date_user))%>%
+  #Convert date gaps in full weeks units
+  mutate(diff_date_user_w=floor(diff_date_user/7))%>%
+  mutate(diff_date_movie_w=floor(diff_date_movie/7))
+
+rm(validation)
+```
+
+
+### 2.1.1. Data cleaning
+
+The MovieLens database provides ratings given at time t by user u regarding movie i, which belongs to movie genre g. 
+
+Movie genres provided for a given movie could mix multiple genres in alphabetical order. We will treat unique combinations of movie genres as a specific movie genre (e.g., Comedy and Romance).
+
+I converted the timestamp variable into the date of the rating for each movie i by user u. 
+
+To model the time-varying movie bias discussed in section 2.3.2, I computed the time since the first rating in the database by user u (for any movie), and computed the difference between the date of the rating and this first rating by user u. I rounded this variable in full week units.
+
+To model the time-varying user bias discussed in section 2.3.3, I computed the time since the first rating in the database by movie i (by any user), and computed the difference between the date of the rating and this first rating of movie i. I also rounded this variable in full week units.
+
+
+### 2.1.2. Splitting the data
+
+The 10 million observations database has been split between a training set (edx) and a test set (validation). This analysis has developed models using exclusively the training set before a final assessment on the test set.
+
+Before assessing those models on the validation set, the training set edx has been further divided between a training set (edx_train) and a test set (edx_test) with this later being made of 10% of observations from the training set. The goal is to develop algorithms on this edx_train, while assessing the performance of developed models on this edx_test set.
+
+In case of tuning parameters such as the regularization factor (lambda) for the Penalized Least Squares, I chose the one minimizing the RMSE on this edx_test set.
+
+## 2.2. Data exploration
+
+```{r data_exploration_intro,echo=FALSE, include=FALSE}
+edx_clean <- bind_rows(edx_train_clean,edx_test_clean)
+
+```
+
+Movie ratings can take any value from 0.5 to 5 stars. While full star ratings are more common (e.g., 3 or 4), the user is allowed to give a half-star rating (e.g., 3.5).
+
+
+```{r distr_ratings,echo=FALSE}
+edx_clean%>%
+  group_by(rating)%>%
+  ggplot(aes(rating))+
+  geom_bar(color="black",fill="brown")+
+  scale_y_continuous(name="",breaks=seq(500000,2500000,500000),labels=c("500 000", "1 000 000", "1 500 000", "2 000 000", "2 500 000"))+
+  scale_x_continuous(breaks=seq(0.5,5,0.5))+
+  xlab("Movie rating")+
+  ggtitle("Distribution of movie ratings")  
+```
+
+One important dimension of the MovieLens dataset is the high imbalance between users recorded in the database. In fact, this heterogenity evidenced in the following graph induces different amount of information used to capture user-specific effects (biases hereafter). 
+
+This will motivate the Penalized Least Square error framework to discriminate user biases computed on smaller sample sizes.
+
+
+```{r N_ratings_per_user,echo=FALSE}
+edx_clean%>%
+  group_by(userId)%>%
+  summarize(n=n())%>%
+  select(userId,n)%>%
+  distinct()%>%
+  ungroup()%>%
+  ggplot(aes(n))+
+  geom_histogram(binwidth=.1,color="black",fill="brown")+
+  scale_x_log10()+
+  xlab("N of ratings per user")+
+  ylab("")+
+  ggtitle("Distribution of the number of ratings by user")
+
+```
+
+The heterogeneity according to the number of ratings per movie is even more strikking, with a number of ratings from 1 to tens of thousands as evidenced below.
+
+
+```{r N_ratings_per_movie,echo=FALSE}
+edx_clean%>%
+  group_by(movieId)%>%
+  summarize(n=n())%>%
+  select(movieId,n)%>%
+  distinct()%>%
+  ungroup()%>%
+  ggplot(aes(n))+
+  geom_histogram(binwidth=.1,color="black",fill="brown")+
+  scale_x_log10()+
+  xlab("N of ratings per movie")+
+  ylab("")+
+  ggtitle("Distribution of the number of ratings by movie")
+
+```
+
+Let's analyze the relationship between the number of weeks since the first rating by any user for movie i in the dataset, and the average rating. 
+
+The underlying assumption is that older movies could become more popular across time which could drive the ratings upward. In fact, we observe an increase in the average rating when the rating occured further in time from the first rating of this movie. It becomes especially significant when the time gap becomes higher than 10 years (520 weeks), even though those observations are built on smaller sample sizes.
+
+We call this bias the time-varying movie bias, and we will also penalize time-varying movie biases built on smaller sample sizes. 
+
+```{r time_var_movie_effect,echo=FALSE}
+edx_clean%>%
+  group_by(diff_date_movie_w)%>%
+  summarize(mean_rating=mean(rating))%>%
+  ggplot(aes(diff_date_movie_w,mean_rating))+
+  geom_point(alpha=.5,color="brown")+
+  geom_smooth(method="loess")+
+  xlab("N weeks since the first movie rating by any user")+
+  ylab("")+
+  ggtitle("Time-varying movie effect on average ratings")
+
+```
+
+We may also think about the possibility of a time-varying user bias. In fact, one individual may become harsher in his ratings across time as he keeps on watching and/or rating movies.
+
+This bias seems less apparent than the time-varying user bias. However, we observe a slight decrease in average ratings over ratings occuring more than 10 years later than the user's first rating.
+
+Likewise, those later biases could be built on smaller sample sizes which will be accounted for with regularization.
+
+
+```{r time_var_user_effect, echo=FALSE} 
+edx_clean%>%
+  group_by(diff_date_user_w)%>%
+  summarize(mean_rating=mean(rating))%>%
+  ggplot(aes(diff_date_user_w,mean_rating))+
+  geom_point(alpha=.5,color="brown")+
+  geom_smooth(method="loess")+
+  xlab("N weeks since the first user rating for any movie")+
+  ylab("")+
+  ggtitle("Time-varying user effect on average ratings")
+
+```
+
+Another potential driver of movie rating could be the movie genre. In fact, we may expect some less consensual movie genres (e.g., horror) to receive lower average rating than others. We refer to this effect as the movie genre bias.
+
+Let's remind that movie genre is referrenced in the database as a potential combination of multiple genres in alphabetical order.
+
+```{r identify_genre_types}
+###Unique combinations of genres
+genres <- unique(edx_clean$genres)
+length(genres) #Number of movie genres combinations
+```
+
+In this analysis, we will focus on those genres combinations as specific movie genres with their own biases.
+
+However, it may be more illustrative to provide insights on the main genres. I distinguished 19 genres whose average ratings are represented below.
+
+It seems clear that movies within the same genre share common features driving their average rating, i.e. their bias, in a specific direction. Thus, this analysis will provide movie rating predictions modelling genres biases.
+
+```{r rating_by_genre,echo=FALSE}
+
+###Creation of genre logical vectors
+genres_d_edx<- map_dfc(1:length(genres_types),function(i){
+  str_detect(edx_clean$genres,genres_types[i])%>%
+    as_tibble_col(column_name = genres_types[i])
+})
+
+###Product_rating function for mutate_at
+#Goal: Replacing the logical vectors by the rating when movie i belongs to genre g
+product_rating <- function(x){
+  x*edx_clean$rating
+}
+
+###If_else function for mutate_at
+#Goal: Replace the genre_rating vector by NA if movie i does not belong to genre g
+if_else_zero <- function(x){
+  ifelse(x==0,NA,x)
+}
+
+###Average ratings and movie genres
+edx_clean%>%
+  #Adding the genres logical vector
+  bind_cols(genres_d_edx)%>%
+  #Replacing by the rating in case movie i belongs to genre g
+  mutate_at(.vars = genres_types,product_rating)%>%
+  mutate_at(.vars = genres_types,if_else_zero)%>%
+  #Mean rating by movie genre
+  summarize_at(.vars = genres_types,mean,na.rm=TRUE)%>%
+  #Tidy format
+  pivot_longer(everything(),names_to = "Genre",values_to ="Mean_rating" )%>%
+  #Reorder genres
+  mutate(Genre=reorder(Genre,Mean_rating))%>%
+  arrange(desc(Mean_rating))%>%
+  #Graph
+  ggplot(aes(Genre,Mean_rating))+
+  geom_bar(stat="identity",col="black",fill="brown")+
+  coord_flip()+
+  ylab("Average rating")+
+  xlab("")+
+  ggtitle("Average rating by movie genre")
+
+```
+
+```{r end_exploration,echo=FALSE,include=FALSE}
+rm(edx_clean, genres_d_edx)
+```
+
+
+## 2.3. Models
+
+```{r rmse_function, echo=FALSE, include=FALSE}
+##RMSE function
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+
+```
+
+### 2.3.1. Model 1: User and movie bias
+
+We can view a rating $R_{u,i}$ given by user u for movie i as following an average rating $\mu$ corrected for user bias $b_{u}$ and movie bias $b_{i}$.
+
+$$R_{i,u}=\mu+b_{u}+b_{i}+\epsilon_{i,u}$$
+
+In this model, $\epsilon_{i,u}$ errors are assumed independent which may not be true in case of omitted variable. One important omission here occurs in case movie bias or user bias follow a time-varying function. This limitation motivated the development of the following models.
+
+```{r model_1_train,echo=FALSE, include=FALSE}
+
+###Notes
+# -Training the model on edx_train 
+#   and assessing him on edx_test for the time being
+###
+
+###Average rating
+mu <- mean(edx_train_clean$rating)
+
+###Movie bias
+movie_avgs <- edx_train_clean %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+###User bias
+user_avgs <- edx_train_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+###Predict rating
+predicted_rating <- edx_test_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred=mu+b_i+b_u)%>%
+  pull(pred)
+
+###RMSE
+rmse_model1_train <- RMSE(edx_test_clean$rating,predicted_rating)
+rmse_results_train <- tibble(method = "Baseline (User and Movie effects)", 
+                                 RMSE = rmse_model1_train)
+
+```
+
+
+### 2.3.2. Model 2: Introducting time-varying movie bias
+
+Irrespective of user biases, a given movie i may not be rated identically across time.
+
+Such movie i could see a time-varying pattern in its ratings, with older movies being potentially rated higher as they become classics. Thus, the model integrates a time-varying movie bias $b_{i,t}$.
+
+$$R_{i,u}=\mu+b_{u}+b_{i}+b_{i,t}+\epsilon_{i,u}$$
+
+
+After exploring the possibility of using the gap between the rating date and the movie year, I preferred to rely on the gap between the rating date and the first rating regarding movie i in the database.
+
+In fact, the former could have been misleading since some movies came from the first part of the $20^{th}$ century so that their time gap from the rating would have been less informative.
+
+
+```{r model_2_train,echo=FALSE, include=FALSE}
+
+###Notes
+# -Training the model on edx_train 
+#   and assessing him on edx_test for the time being
+###
+
+###Average rating
+mu <- mean(edx_train_clean$rating)
+
+###Movie bias
+movie_avgs <- edx_train_clean %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+###User bias
+user_avgs <- edx_train_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+###Time-varying movie bias
+movie_time_avgs <- edx_train_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(diff_date_movie_w) %>%
+  summarize(b_it = mean(rating - mu - b_i - b_u))
+
+###Predict rating
+predicted_rating <- edx_test_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w')%>%
+  mutate(pred=mu+b_i+b_u+b_it)%>%
+  pull(pred)
+
+###RMSE
+rmse_model2_train <- RMSE(edx_test_clean$rating,predicted_rating)
+rmse_results_train <- bind_rows(rmse_results_train,
+                                tibble(method = "Baseline + Movie-time effects", 
+                                       RMSE = rmse_model2_train))
+
+
+```
+
+
+### 2.3.3. Model 3: Introducting Time-varying user bias
+
+Irrespective of movie biases, a given movie may not be rated identically across time by user u. 
+
+In fact, a given user may become more harsh in its rating over time as he keeps on watching and rating movies. We refer to this effect as the time-varying user bias $b_{u,t}$.
+
+$$R_{i,u}=\mu+b_{u}+b_{i}+b_{i,t}+b_{u,t}+\epsilon_{i,u}$$
+
+
+
+```{r model_3_train,echo=FALSE, include=FALSE}
+
+###Notes
+# -Training the model on edx_train 
+#   and assessing him on edx_test for the time being
+###
+
+###Average rating
+mu <- mean(edx_train_clean$rating)
+
+###Movie bias
+movie_avgs <- edx_train_clean %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+###User bias
+user_avgs <- edx_train_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+###Time-varying movie bias
+movie_time_avgs <- edx_train_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(diff_date_movie_w) %>%
+  summarize(b_it = mean(rating - mu - b_i - b_u))
+
+###Time-varying user bias
+user_time_avgs <- edx_train_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+  group_by(diff_date_user_w) %>%
+  summarize(b_ut = mean(rating - mu - b_i - b_u - b_it))  
+
+###Predict rating
+predicted_rating <- edx_test_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w')%>%
+  left_join(user_time_avgs,by='diff_date_user_w')%>%
+  mutate(pred=mu+b_i+b_u+b_it+b_ut)%>%
+  pull(pred)
+
+###RMSE
+rmse_model3_train <- RMSE(edx_test_clean$rating,predicted_rating)
+rmse_results_train <- bind_rows(rmse_results_train,
+                                tibble(method = "Baseline + (User-time and Movie-time) effects", 
+                                       RMSE = rmse_model3_train))
+
+```
+
+
+### 2.3.4. Model 4: Introducing Movie genre bias
+
+Movie-specific biases defined previously catch movie specific features driving their average rating. However, errors from previous models could be seen as dependent since errors from identical movie genres could be correlated. 
+
+It may happen since on average people could be more harsh in their ratings for less consensual genres than others. Thus, the model includes a gender bias $b_{g}$ for any specific combination of movie genres g. 
+
+$$R_{i,u}=\mu+b_{u}+b_{i}+b_{i,t}+b_{u,t}+b_{g}+\epsilon_{i,u}$$
+
+```{r model_4_train,echo=FALSE, include=FALSE}
+
+###Notes
+# -Training the model on edx_train 
+#   and assessing him on edx_test for the time being
+###
+
+###Average rating
+mu <- mean(edx_train_clean$rating)
+
+###Movie bias
+movie_avgs <- edx_train_clean %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+###User bias
+user_avgs <- edx_train_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+###Time-varying movie bias
+movie_time_avgs <- edx_train_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(diff_date_movie_w) %>%
+  summarize(b_it = mean(rating - mu - b_i - b_u))
+
+###Time-varying user bias
+user_time_avgs <- edx_train_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+  group_by(diff_date_user_w) %>%
+  summarize(b_ut = mean(rating - mu - b_i - b_u - b_it))  
+
+###Movie genres bias
+genres_avgs <- edx_train_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+  left_join(user_time_avgs,by='diff_date_user_w')%>%
+  group_by(genres) %>%
+  summarize(b_g = mean(rating - mu - b_i - b_u - b_it- b_ut))  
+
+###Predict rating
+predicted_rating <- edx_test_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w')%>%
+  left_join(user_time_avgs,by='diff_date_user_w')%>%
+  left_join(genres_avgs,by='genres')%>%
+  mutate(pred=mu+b_i+b_u+b_it+b_ut+b_g)%>%
+  pull(pred)
+
+###RMSE
+rmse_model4_train <- RMSE(edx_test_clean$rating,predicted_rating)
+rmse_results_train <- bind_rows(rmse_results_train,
+                                tibble(method = "Baseline + (User-time, Movie-time, Genres) effects",                                                                               RMSE = rmse_model4_train))
+
+
+###Remove temporary files
+rm(movie_avgs,user_avgs,user_time_avgs,movie_time_avgs,
+   genres_avgs,predicted_rating)
+```
+
+
+### 2.3.5. Model 5: Regularized model with all biases
+
+One drawback of the previous models rely in the computation of biases on small sample sizes which could over or under-estimate the biases.
+
+To tackle this problem, this analysis regularizes the estimated biases by a regularization factor $\lambda$.
+
+$\lambda$ could be viewed as a tuning parameter since we aim at choosing the $\lambda$ value which minimizes the RMSE on the edx_test set after training the algorithm on the edx_train set.
+
+One alternative could have been to build on cross-validation techniques such a k-fold cross-validation (averaging RMSEs across k mutually exclusive edx_test sets from the edx set) or Bootstraping (averaging RMSEs assessed across k samples extracted randomly with replacement from the edx set, and training the algorithm in each case on the remaining share of the edx set).
+
+Nevertheless, the size of the dataset analysed would increase substantially the computation time involving such techniques. Thus, I used a second-best approach consisting in training models for various lambda cut-offs on the edx_train set, and selecting the lambda value which minimizes the RMSE on the edx_test set.
+
+Instead of minimizing the least squares equation, we aim at picking the penalty term lambda which minimizes the following equation.
+
+$$\sum_{i,u}(R_{i,u}-\mu-b_{u}-b_{i}-b_{u,t}-b_{i,t}-b_{g})^2+\lambda*\sum_{i,u}(b_{u}^2+b_{i}^2+b_{u,t}^2+b_{i,t}^2+b_{g}^2)$$
+```{r model_5_train,echo=FALSE, include=FALSE}
+
+###Notes
+# -Training the model on edx_train 
+#   and assessing him on edx_test for the time being
+###
+
+###Vector of lambda values
+lambdas <- seq(0,10,.25)
+
+###RMSE vector depending on lambda
+rmses <- sapply(lambdas,function(l){
+  
+  print(paste0("Lambda: ",l))   
+  lambda <- l
+  
+  ###Average rating
+  mu <- mean(edx_train_clean$rating)
+  print("Average rating OK")
+  
+  ###Movie bias
+  movie_avgs <- edx_train_clean %>% 
+    group_by(movieId) %>% 
+    summarize(b_i = sum(rating - mu)/(n()+lambda))
+  print("Movie bias OK")
+  
+  ###User bias
+  user_avgs <- edx_train_clean %>% 
+    left_join(movie_avgs, by='movieId') %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu - b_i)/(n()+lambda))
+  print("User bias OK")
+  
+  ###Time-varying movie bias
+  movie_time_avgs <- edx_train_clean %>% 
+    left_join(movie_avgs, by='movieId') %>%
+    left_join(user_avgs, by='userId') %>%
+    group_by(diff_date_movie_w) %>%
+    summarize(b_it = sum(rating - mu - b_i - b_u)/(n()+lambda))
+  print("Movie time bias OK")
+  
+  ###Time-varying user bias
+  user_time_avgs <- edx_train_clean%>%
+    left_join(movie_avgs, by='movieId') %>%
+    left_join(user_avgs, by='userId') %>%
+    left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+    group_by(diff_date_user_w) %>%
+    summarize(b_ut = sum(rating - mu - b_i - b_u - b_it)/(n()+lambda))  
+  print("User time bias OK")
+  
+  ###Movie genres bias
+  genres_avgs <- edx_train_clean%>%
+    left_join(movie_avgs, by='movieId') %>%
+    left_join(user_avgs, by='userId') %>%
+    left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+    left_join(user_time_avgs,by='diff_date_user_w')%>%
+    group_by(genres) %>%
+    summarize(b_g = mean(rating - mu - b_i - b_u - b_it- b_ut)/(n()+lambda))  
+  print("Genre bias OK")
+  
+  ###Predict rating
+  predicted_rating <- edx_test_clean%>%
+    left_join(movie_avgs, by='movieId') %>%
+    left_join(user_avgs, by='userId') %>%
+    left_join(movie_time_avgs, by='diff_date_movie_w')%>%
+    left_join(user_time_avgs,by='diff_date_user_w')%>%
+    left_join(genres_avgs,by='genres')%>%
+    mutate(pred=mu+b_i+b_u+b_it+b_ut+b_g)%>%
+    pull(pred)
+  print("Prediction OK")
+  
+  return(RMSE(edx_test_clean$rating,predicted_rating))
+})
+
+rmse_model5_train <- min(rmses)
+rmse_results_train <- bind_rows(rmse_results_train,
+                                tibble(method = "Reg. Baseline + (User-time, Movie-time, Genres) effects", 
+                                       RMSE = rmse_model5_train))
+
+```
+
+
+
+## 2.4. Model assessment
+
+I considered the rating as a continuous variable despite its definition as 0.5 star multiples.
+
+Thus, models are assessed through the Root Mean Square Error (RMSE hereafter) between the actual $R_{i,u}$ and predicted $R_{i,u}^{pred}$ ratings
+
+$$RMSE_{i,u}=\sqrt{\frac{1}{N}\sum_{i,u}(R_{i,u}^{pred}-R_{i,u})^2}$$
+
+
+
+
+# 3. Results
+
+First, let's focus on results from models developed in the training set, by training over edx_train and testing over edx_test.
+
+
+```{r results_train,echo=FALSE}
+
+###Summing up results developed in the training set (edx)
+options(digits = 5)
+kable(rmse_results_train)
+```
+
+It appears the models lower the RMSEs as we introduce biases. Besides, the best performing model is the $5^{th}$ which features the regularization term $\lambda$.
+
+```{r model_5_train_lambda,echo=FALSE}
+###Plotting RMSE vs lambda
+qplot(lambdas,rmses)+xlab("Lambda")+ylab("RMSE")
+
+###Optimal lambda parameter
+lambda_star <- lambdas[which.min(rmses)]
+print(paste0("Optimal lambda is ",as.character(lambda_star)))
+```
+
+The parameter $\lambda$ which minimizes RMSE is 5.25, so we will use this value for the final assessment on the validation test.
+
+
+```{r train_merge,echo=FALSE, include=FALSE}
+###Merging the training set edx
+edx_clean <- bind_rows(edx_train_clean,edx_test_clean)
+rm(edx_train_clean,edx_test_clean)
+
+```
+
+
+```{r model_1_validation,echo=FALSE, include=FALSE}
+
+###Notes
+# -Training the model on edx 
+#   and assessing him on validation
+###
+
+###Average rating
+mu <- mean(edx_clean$rating)
+
+###Movie bias
+movie_avgs <- edx_clean %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+###User bias
+user_avgs <- edx_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+###Predict rating
+predicted_rating <- validation_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred=mu+b_i+b_u)%>%
+  pull(pred)
+
+###RMSE
+rmse_model1_validation <- RMSE(validation_clean$rating,predicted_rating)
+rmse_results_validation <- tibble(method = "Baseline (User and Movie effects)", 
+                                 RMSE = rmse_model1_validation)
+
+```
+
+```{r model_2_validation,echo=FALSE, include=FALSE}
+
+###Notes
+# -Training the model on edx 
+#   and assessing him on validation
+###
+
+
+###Average rating
+mu <- mean(edx_clean$rating)
+
+###Movie bias
+movie_avgs <- edx_clean %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+###User bias
+user_avgs <- edx_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+###Time-varying movie bias
+movie_time_avgs <- edx_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(diff_date_movie_w) %>%
+  summarize(b_it = mean(rating - mu - b_i - b_u))
+
+###Predict rating
+predicted_rating <- validation_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w')%>%
+  mutate(pred=mu+b_i+b_u+b_it)%>%
+  pull(pred)
+
+###RMSE
+rmse_model2_validation <- RMSE(validation_clean$rating,predicted_rating)
+rmse_results_validation <- bind_rows(rmse_results_validation,
+                                     tibble(method = "Baseline + Movie-time effects", 
+                                            RMSE = rmse_model2_validation))
+
+```
+
+```{r model_3_validation,echo=FALSE, include=FALSE}
+
+###Notes
+# -Training the model on edx 
+#   and assessing him on validation
+###
+
+
+###Average rating
+mu <- mean(edx_clean$rating)
+
+###Movie bias
+movie_avgs <- edx_clean %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+###User bias
+user_avgs <- edx_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+###Time-varying movie bias
+movie_time_avgs <- edx_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(diff_date_movie_w) %>%
+  summarize(b_it = mean(rating - mu - b_i - b_u))
+
+###Time-varying user bias
+user_time_avgs <- edx_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+  group_by(diff_date_user_w) %>%
+  summarize(b_ut = mean(rating - mu - b_i - b_u - b_it))  
+
+###Predict rating
+predicted_rating <- validation_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w')%>%
+  left_join(user_time_avgs,by='diff_date_user_w')%>%
+  mutate(pred=mu+b_i+b_u+b_it+b_ut)%>%
+  pull(pred)
+
+###RMSE
+rmse_model3_validation <- RMSE(validation_clean$rating,predicted_rating)
+rmse_results_validation <- bind_rows(rmse_results_validation,
+                                     tibble(method = "Baseline +(User-time and Movie-time) effects", 
+                                 RMSE = rmse_model3_validation))
+
+```
+
+```{r model_4_validation,echo=FALSE, include=FALSE}
+
+###Notes
+# -Training the model on edx 
+#   and assessing him on validation
+###
+
+###Average rating
+mu <- mean(edx_clean$rating)
+
+###Movie bias
+movie_avgs <- edx_clean %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+###User bias
+user_avgs <- edx_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+###Time-varying movie bias
+movie_time_avgs <- edx_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(diff_date_movie_w) %>%
+  summarize(b_it = mean(rating - mu - b_i - b_u))
+
+###Time-varying user bias
+user_time_avgs <- edx_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+  group_by(diff_date_user_w) %>%
+  summarize(b_ut = mean(rating - mu - b_i - b_u - b_it))  
+
+###Movie genres bias
+genres_avgs <- edx_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+  left_join(user_time_avgs,by='diff_date_user_w')%>%
+  group_by(genres) %>%
+  summarize(b_g = mean(rating - mu - b_i - b_u - b_it- b_ut))  
+
+###Predict rating
+predicted_rating <- validation_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w')%>%
+  left_join(user_time_avgs,by='diff_date_user_w')%>%
+  left_join(genres_avgs,by='genres')%>%
+  mutate(pred=mu+b_i+b_u+b_it+b_ut+b_g)%>%
+  pull(pred)
+
+###RMSE
+rmse_model4_validation <- RMSE(validation_clean$rating,predicted_rating)
+rmse_results_validation <- bind_rows(rmse_results_validation,
+                                     tibble(method = "Baseline + (User-time, Movie-time, Genres) effects", 
+                                            RMSE = rmse_model4_validation))
+
+###Remove previous data
+rm(genres_avgs,movie_avgs,movie_time_avgs,
+   user_avgs,user_time_avgs,mu,predicted_rating)
+
+
+```
+
+```{r model_5_validation,echo=FALSE, include=FALSE}
+
+
+###Notes
+# -Training the model on edx 
+#   and assessing him on validation
+#   Using lambda found as optimal on the training set  
+###
+
+###Average rating
+mu <- mean(edx_clean$rating)
+
+###Movie bias
+movie_avgs <- edx_clean %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda_star))
+
+###User bias
+user_avgs <- edx_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu - b_i)/(n()+lambda_star))
+
+###Time-varying movie bias
+movie_time_avgs <- edx_clean %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  group_by(diff_date_movie_w) %>%
+  summarize(b_it = sum(rating - mu - b_i - b_u)/(n()+lambda_star))
+
+###Time-varying user bias
+user_time_avgs <- edx_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+  group_by(diff_date_user_w) %>%
+  summarize(b_ut = sum(rating - mu - b_i - b_u - b_it)/(n()+lambda_star))  
+
+###Movie genres bias
+genres_avgs <- edx_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w') %>%
+  left_join(user_time_avgs,by='diff_date_user_w')%>%
+  group_by(genres) %>%
+  summarize(b_g = mean(rating - mu - b_i - b_u - b_it- b_ut)/(n()+lambda_star))  
+
+###Predict rating
+predicted_rating <- validation_clean%>%
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  left_join(movie_time_avgs, by='diff_date_movie_w')%>%
+  left_join(user_time_avgs,by='diff_date_user_w')%>%
+  left_join(genres_avgs,by='genres')%>%
+  mutate(pred=mu+b_i+b_u+b_it+b_ut+b_g)%>%
+  pull(pred)
+print("Prediction OK")
+
+###RMSE
+rmse_model5_validation <- RMSE(validation_clean$rating,predicted_rating)
+rmse_results_validation <- bind_rows(rmse_results_validation,
+                                     tibble(method = "Reg. Baseline + (User-time, Movie-time, Genres) effects", 
+                                            RMSE = rmse_model5_validation))
+
+```
+
+For the final assessment of those algorithms, we build the models trained previously, but this time on the whole training set (edx), before assessing them on the test set (validation). Results are presented below.
+
+```{r results_validation, echo=FALSE}
+###Summing up results
+options(digits = 5)
+kable(rmse_results_validation)
+```
+
+Despite being a bit higher than those computed on the edx_test set, the RMSEs decrease across models, with the $5^{th}$ model with regularization providing the better performance.
+
+We can compute the percentage of RMSE decrease from the $1^{st}$ model to the last one as follows.
+
+```{r results_validation_improvement}
+###Improvement from model 1 to model 5
+(rmse_model1_validation-rmse_model5_validation)*100/rmse_model1_validation
+```
+
+
+# 4. Conclusion
+
+Building on a baseline model featuring user and movie biases in a Least Square framework, this analysis has modeled extra biases (time-varying user and movie biases, genre bias), while also adapting Penalized Least Squares to this framework. 
+
+When assessing the performance of our rating prediction algorithm (developed on the edx set) on the validation set, we went from a RMSE of 0.8653 in the baseline model to 0.8643 for the regularized model with all biases.
+While such improvement could be seen as limited, it still reduces the RMSE by 0.12%.
+
+The algorithm could be improved further in a couple of directions. 
+
+For instance, a user-genre bias could be introduced by computing the average user-specific deviation when rating movies from the same genre.
+
+Besides, matrix factorization could be used to decompose the residuals into latent factors thanks to Principal Component Analysis (PCA) or Singular Value Decomposition (SVD).
